@@ -1,0 +1,17 @@
+# Python dependencies for OpenAlgo trading scripts
+
+# Kite Connect SDK
+kiteconnect>=5.0.0
+
+# Browser automation for auto-login
+playwright>=1.40.0
+
+# TOTP generation
+pyotp>=2.9.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
