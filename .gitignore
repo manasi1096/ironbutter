@@ -1,0 +1,38 @@
+# Environment files (NEVER commit these!)
+.env
+*.env
+.env.*
+!.env.example
+
+# Credentials and keys
+*.key
+*.pem
+credentials.json
+access_token.txt
+
+# Position and trade data
+current_position.json
+trade_history/
+
+# Logs
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Skip dates (optional - may contain personal schedule)
+# skip_dates.txt

@@ -58,10 +58,22 @@ KITE_ACCESS_TOKEN = os.getenv('KITE_ACCESS_TOKEN')
 # Trading parameters
 TRADING_SYMBOL = os.getenv('TRADING_SYMBOL', 'NIFTY')
 QUANTITY = int(os.getenv('QUANTITY', 65))  # 1 lot of Nifty = 65
-STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', 50))  # 50% of max loss
+STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', 40))  # 40% of max loss
 
 # Gap threshold for spread selection (in points)
 GAP_THRESHOLD = int(os.getenv('GAP_THRESHOLD', 50))
+
+# Max gap threshold - skip trade if gap exceeds this (extreme moves don't mean-revert)
+MAX_GAP_THRESHOLD = int(os.getenv('MAX_GAP_THRESHOLD', 200))
+
+# Early profit exit - close when P&L reaches this % of credit received
+EARLY_PROFIT_PCT = float(os.getenv('EARLY_PROFIT_PCT', 60))
+
+# VIX threshold - skip trade if India VIX is above this level
+VIX_THRESHOLD = float(os.getenv('VIX_THRESHOLD', 18))
+
+# Skip expiry days (low premiums + high margin)
+SKIP_EXPIRY_DAY = os.getenv('SKIP_EXPIRY_DAY', 'true').lower() == 'true'
 
 # Exit time in IST - converted to UTC for VM (IST = UTC + 5:30)
 EXIT_TIME_IST_STR = os.getenv('EXIT_TIME', '15:15')
@@ -75,6 +87,10 @@ EXIT_TIME = dtime(utc_hour, utc_min)
 
 # Hedge distance (OTM strikes for protection)
 HEDGE_DISTANCE = int(os.getenv('HEDGE_DISTANCE', 150))
+
+# Retry configuration
+MAX_RETRIES = int(os.getenv('MAX_RETRIES', 3))
+RETRY_DELAY = int(os.getenv('RETRY_DELAY', 5))  # seconds between retries
 
 # Strike step based on index
 STRIKE_STEPS = {
@@ -97,6 +113,69 @@ except ImportError:
     TELEGRAM_AVAILABLE = False
     logger.warning("Telegram notifier not available")
 
+# Import CSV logger
+try:
+    from generate_csv import append_trade, append_failed
+    CSV_AVAILABLE = True
+except ImportError:
+    CSV_AVAILABLE = False
+    logger.warning("CSV logger not available")
+
+
+def retry_api_call(func, *args, max_retries=None, retry_delay=None, **kwargs):
+    """
+    Retry an API call with exponential backoff.
+    
+    Args:
+        func: Function to call
+        *args: Positional arguments for func
+        max_retries: Override default max retries
+        retry_delay: Override default retry delay
+        **kwargs: Keyword arguments for func
+    
+    Returns:
+        Result of the function call
+    
+    Raises:
+        Last exception if all retries fail
+    """
+    retries = max_retries if max_retries is not None else MAX_RETRIES
+    delay = retry_delay if retry_delay is not None else RETRY_DELAY
+    
+    last_exception = None
+    
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            
+            # Don't retry for certain errors (authentication, insufficient funds, etc.)
+            non_retryable = [
+                'invalid api key',
+                'invalid access token',
+                'token expired',
+                'insufficient funds',
+                'margin',
+                'rejected',
+                'disabled for your account'
+            ]
+            
+            if any(err in error_msg for err in non_retryable):
+                logger.error(f"Non-retryable error: {e}")
+                raise
+            
+            if attempt < retries - 1:
+                wait_time = delay * (attempt + 1)  # Linear backoff
+                logger.warning(f"API call failed (attempt {attempt + 1}/{retries}): {e}")
+                logger.info(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                logger.error(f"All {retries} attempts failed. Last error: {e}")
+    
+    raise last_exception
+
 
 def get_kite_client():
     """Initialize and return Kite Connect client."""
@@ -115,7 +194,7 @@ def get_atm_strike(spot_price, symbol='NIFTY'):
 def get_previous_close(kite):
     """Get previous day's closing price."""
     spot_symbol = f"NSE:{TRADING_SYMBOL} 50" if TRADING_SYMBOL == "NIFTY" else f"NSE:{TRADING_SYMBOL}"
-    quote = kite.quote([spot_symbol])
+    quote = retry_api_call(kite.quote, [spot_symbol])
     return quote[spot_symbol]['ohlc']['close']
 
 
@@ -161,7 +240,7 @@ def get_option_symbols(kite, atm_strike, spread_type):
         dict with symbols for the spread
     """
     logger.info("Fetching NIFTY instruments from Kite...")
-    instruments = kite.instruments('NFO')
+    instruments = retry_api_call(kite.instruments, 'NFO')
     nifty_opts = [i for i in instruments if i['name'] == 'NIFTY' and i['instrument_type'] in ['CE', 'PE']]
     
     today = date.today()
@@ -242,6 +321,81 @@ def is_trading_day(notify=False):
     return True
 
 
+def verify_order(order_id, description):
+    """Verify order status and return fill price."""
+    kite = get_kite_client()
+    time.sleep(1)  # Wait for order to process
+    
+    for attempt in range(5):
+        orders = retry_api_call(kite.orders)
+        for order in orders:
+            if order['order_id'] == order_id:
+                status = order['status']
+                if status == 'COMPLETE':
+                    fill_price = order['average_price']
+                    logger.info(f"  ✓ {description}: FILLED @ ₹{fill_price}")
+                    return True, fill_price
+                elif status == 'REJECTED':
+                    reason = order.get('status_message', 'Unknown')
+                    logger.error(f"  ✗ {description}: REJECTED - {reason}")
+                    return False, reason
+                elif status in ['PENDING', 'OPEN', 'TRIGGER PENDING']:
+                    logger.info(f"  ⏳ {description}: {status}")
+                    time.sleep(1)
+                    continue
+        time.sleep(0.5)
+    
+    return False, "Order status unknown after timeout"
+
+
+def rollback_orders(executed_orders):
+    """Square off any partially executed orders."""
+    if not executed_orders:
+        return
+        
+    logger.warning(f"Rolling back {len(executed_orders)} executed orders...")
+    kite = get_kite_client()
+    
+    for order in executed_orders:
+        try:
+            reverse_type = kite.TRANSACTION_TYPE_BUY if order['type'] == 'SELL' else kite.TRANSACTION_TYPE_SELL
+            
+            rollback_order = kite.place_order(
+                variety=kite.VARIETY_REGULAR,
+                exchange=kite.EXCHANGE_NFO,
+                tradingsymbol=order['symbol'],
+                transaction_type=reverse_type,
+                quantity=QUANTITY,
+                product=kite.PRODUCT_MIS,
+                order_type=kite.ORDER_TYPE_MARKET
+            )
+            logger.info(f"  Rolled back {order['symbol']}: Order ID {rollback_order}")
+        except Exception as e:
+            logger.error(f"  Failed to rollback {order['symbol']}: {e}")
+
+
+def is_expiry_day(kite):
+    """Check if today is a NIFTY weekly expiry day."""
+    instruments = retry_api_call(kite.instruments, 'NFO')
+    nifty_opts = [i for i in instruments if i['name'] == 'NIFTY' and i['instrument_type'] in ['CE', 'PE']]
+    today = date.today()
+    expiries = sorted(set(i['expiry'] for i in nifty_opts if i['expiry'] >= today))
+    if expiries and expiries[0] == today:
+        return True
+    return False
+
+
+def check_vix(kite):
+    """Fetch India VIX value."""
+    try:
+        vix_quote = retry_api_call(kite.quote, ['NSE:INDIA VIX'])
+        vix_value = vix_quote['NSE:INDIA VIX']['last_price']
+        return vix_value
+    except Exception as e:
+        logger.warning(f"Could not fetch VIX: {e}")
+        return None
+
+
 def execute_credit_spread():
     """Execute the 9:20 AM Credit Spread strategy."""
     logger.info("=" * 60)
@@ -258,20 +412,56 @@ def execute_credit_spread():
     try:
         kite = get_kite_client()
         
-        # Get current and previous close prices
+        # PRE-TRADE FILTERS
+        
+        # Filter 1: Skip expiry days
+        if SKIP_EXPIRY_DAY and is_expiry_day(kite):
+            reason = "Expiry day - low premiums and high margin, skipping"
+            logger.info(f"SKIP: {reason}")
+            if TELEGRAM_AVAILABLE:
+                notify_no_trade(reason)
+            if CSV_AVAILABLE:
+                append_failed(str(date.today()), reason)
+            return None
+        
+        # Filter 2: VIX check
+        vix_value = check_vix(kite)
+        if vix_value is not None:
+            logger.info(f"India VIX: {vix_value:.2f} (threshold: {VIX_THRESHOLD})")
+            if vix_value > VIX_THRESHOLD:
+                reason = f"VIX too high ({vix_value:.1f} > {VIX_THRESHOLD}) - volatile market, skipping"
+                logger.info(f"SKIP: {reason}")
+                if TELEGRAM_AVAILABLE:
+                    notify_no_trade(reason)
+                if CSV_AVAILABLE:
+                    append_failed(str(date.today()), reason)
+                return None
+        
+        # Get current and previous close prices (with retry)
         spot_symbol = f"NSE:{TRADING_SYMBOL} 50" if TRADING_SYMBOL == "NIFTY" else f"NSE:{TRADING_SYMBOL}"
-        quote = kite.quote([spot_symbol])
+        logger.info(f"Fetching quote for {spot_symbol}...")
+        quote = retry_api_call(kite.quote, [spot_symbol])
         current_price = quote[spot_symbol]['last_price']
         previous_close = quote[spot_symbol]['ohlc']['close']
         
         # Determine spread type based on gap
         spread_type, gap, gap_percent = determine_spread_type(current_price, previous_close)
         
+        # Filter 3: Skip extreme gap days
+        if abs(gap) > MAX_GAP_THRESHOLD:
+            reason = f"Extreme gap ({gap:+.0f} pts > ±{MAX_GAP_THRESHOLD}) - news-driven move, skipping"
+            logger.info(f"SKIP: {reason}")
+            if TELEGRAM_AVAILABLE:
+                notify_no_trade(reason)
+            if CSV_AVAILABLE:
+                append_failed(str(date.today()), reason)
+            return None
+        
         # Calculate ATM strike
         atm_strike = get_atm_strike(current_price, TRADING_SYMBOL)
         logger.info(f"ATM Strike: {atm_strike}")
         
-        # Get option symbols
+        # Get option symbols (with retry)
         options = get_option_symbols(kite, atm_strike, spread_type)
         
         atm_symbol = options['atm_symbol']
@@ -279,8 +469,9 @@ def execute_credit_spread():
         otm_strike = options['otm_strike']
         expiry = str(options['expiry_date'])
         
-        # Get current option prices
-        option_prices = kite.ltp([f"NFO:{atm_symbol}", f"NFO:{otm_symbol}"])
+        # Get current option prices (with retry)
+        logger.info("Fetching option prices...")
+        option_prices = retry_api_call(kite.ltp, [f"NFO:{atm_symbol}", f"NFO:{otm_symbol}"])
         atm_price = option_prices[f"NFO:{atm_symbol}"]["last_price"]
         otm_price = option_prices[f"NFO:{otm_symbol}"]["last_price"]
         
@@ -292,58 +483,16 @@ def execute_credit_spread():
         
         logger.info(f"ATM Price: {atm_price}")
         logger.info(f"OTM Price: {otm_price}")
-        logger.info(f"Spread Credit: {spread_credit} per share")
-        logger.info(f"Total Credit: ₹{total_credit:.0f}")
+        logger.info(f"Spread Credit: {spread_credit:.2f} (₹{total_credit:.0f} total)")
         logger.info(f"Max Loss: ₹{max_loss_total:.0f}")
         
-        # Place orders - BUY hedge FIRST, then SELL
-        logger.info("=" * 40)
-        logger.info("PLACING ORDERS (Hedge first)...")
-        logger.info("=" * 40)
-        
+        # Place orders - BUY HEDGE FIRST (critical for margin benefit)
         orders = {}
         executed_orders = []
         
-        def verify_order(order_id, description):
-            time.sleep(0.5)
-            order_history = kite.order_history(order_id)
-            final_status = order_history[-1]
-            status = final_status['status']
-            
-            if status == 'COMPLETE':
-                fill_price = final_status.get('average_price', 0)
-                logger.info(f"  ✓ {description}: FILLED @ ₹{fill_price}")
-                return True, fill_price
-            elif status == 'REJECTED':
-                reason = final_status.get('status_message', 'Unknown')
-                logger.error(f"  ✗ {description}: REJECTED - {reason}")
-                return False, reason
-            else:
-                return False, status
-        
-        def rollback_orders(executed):
-            if not executed:
-                return
-            logger.warning("Rolling back executed orders...")
-            for order_info in executed:
-                try:
-                    reverse_type = kite.TRANSACTION_TYPE_SELL if order_info['type'] == 'BUY' else kite.TRANSACTION_TYPE_BUY
-                    kite.place_order(
-                        variety=kite.VARIETY_REGULAR,
-                        exchange=kite.EXCHANGE_NFO,
-                        tradingsymbol=order_info['symbol'],
-                        transaction_type=reverse_type,
-                        quantity=QUANTITY,
-                        product=kite.PRODUCT_MIS,
-                        order_type=kite.ORDER_TYPE_MARKET
-                    )
-                    logger.info(f"  Rolled back: {order_info['symbol']}")
-                except Exception as re:
-                    logger.error(f"  Failed to rollback {order_info['symbol']}: {re}")
-        
         try:
-            # Step 1: Buy OTM (hedge)
-            logger.info(f"Step 1/2: Buying OTM hedge ({otm_symbol})...")
+            # Step 1: Buy OTM option (hedge)
+            logger.info(f"Step 1/2: Buying {otm_symbol} (hedge)...")
             orders['buy_otm'] = kite.place_order(
                 variety=kite.VARIETY_REGULAR,
                 exchange=kite.EXCHANGE_NFO,
@@ -353,14 +502,18 @@ def execute_credit_spread():
                 product=kite.PRODUCT_MIS,
                 order_type=kite.ORDER_TYPE_MARKET
             )
+            logger.info(f"  Order ID: {orders['buy_otm']}")
+            
             success, result = verify_order(orders['buy_otm'], f"Buy {otm_symbol}")
             if not success:
                 raise Exception(f"Buy OTM failed: {result}")
             executed_orders.append({'symbol': otm_symbol, 'type': 'BUY', 'price': result})
             otm_fill_price = result
             
-            # Step 2: Sell ATM (now hedged)
-            logger.info(f"Step 2/2: Selling ATM ({atm_symbol})...")
+            time.sleep(0.3)
+            
+            # Step 2: Sell ATM option (now protected by hedge, lower margin)
+            logger.info(f"Step 2/2: Selling {atm_symbol} (hedged)...")
             orders['sell_atm'] = kite.place_order(
                 variety=kite.VARIETY_REGULAR,
                 exchange=kite.EXCHANGE_NFO,
@@ -370,6 +523,8 @@ def execute_credit_spread():
                 product=kite.PRODUCT_MIS,
                 order_type=kite.ORDER_TYPE_MARKET
             )
+            logger.info(f"  Order ID: {orders['sell_atm']}")
+            
             success, result = verify_order(orders['sell_atm'], f"Sell {atm_symbol}")
             if not success:
                 raise Exception(f"Sell ATM failed: {result}")
@@ -457,12 +612,19 @@ def execute_credit_spread():
         logger.error(traceback.format_exc())
         if TELEGRAM_AVAILABLE:
             notify_error("Strategy Execution Error", str(e))
+        # Log failed trade to CSV
+        if CSV_AVAILABLE:
+            try:
+                append_failed(str(date.today()), str(e)[:100])
+                logger.info("Failed trade logged to CSV")
+            except Exception as csv_err:
+                logger.error(f"Failed to log to CSV: {csv_err}")
         return None
 
 
 def get_current_spread_value(kite, position):
     """Calculate current spread value."""
-    prices = kite.ltp([f"NFO:{position['atm_symbol']}", f"NFO:{position['otm_symbol']}"])
+    prices = retry_api_call(kite.ltp, [f"NFO:{position['atm_symbol']}", f"NFO:{position['otm_symbol']}"])
     
     current_atm = prices[f"NFO:{position['atm_symbol']}"]["last_price"]
     current_otm = prices[f"NFO:{position['otm_symbol']}"]["last_price"]
@@ -502,7 +664,7 @@ def monitor_and_exit():
     try:
         kite = get_kite_client()
         
-        # Get current spread value
+        # Get current spread value (with retry)
         current = get_current_spread_value(kite, position)
         
         entry_credit = position['entry_spread_credit']
@@ -516,9 +678,13 @@ def monitor_and_exit():
         max_loss = position.get('max_loss', float('inf'))
         stop_loss_threshold = max_loss * (STOP_LOSS_PERCENT / 100)
         
+        total_credit = position.get('total_credit', 0)
+        early_profit_target = total_credit * (EARLY_PROFIT_PCT / 100)
+        
         logger.info(f"Entry Credit: {entry_credit:.2f}, Current Spread: {current_spread:.2f}")
         logger.info(f"Unrealized P&L: ₹{unrealized_pnl:.0f} ({pnl_percent:.1f}%)")
-        logger.info(f"Stop Loss: ₹{stop_loss_threshold:.0f} (50% of max loss ₹{max_loss:.0f})")
+        logger.info(f"Stop Loss: ₹{stop_loss_threshold:.0f} ({STOP_LOSS_PERCENT:.0f}% of max loss ₹{max_loss:.0f})")
+        logger.info(f"Profit Target: ₹{early_profit_target:.0f} ({EARLY_PROFIT_PCT:.0f}% of credit ₹{total_credit:.0f})")
         
         now = datetime.now().time()
         should_exit = False
@@ -527,6 +693,9 @@ def monitor_and_exit():
         if unrealized_pnl <= -stop_loss_threshold:
             should_exit = True
             exit_reason = f"STOP LOSS - Lost ₹{abs(unrealized_pnl):.0f} (threshold: ₹{stop_loss_threshold:.0f})"
+        elif unrealized_pnl >= early_profit_target and early_profit_target > 0:
+            should_exit = True
+            exit_reason = f"EARLY PROFIT - Made ₹{unrealized_pnl:.0f} (target: ₹{early_profit_target:.0f} = {EARLY_PROFIT_PCT:.0f}% of credit)"
         elif now >= EXIT_TIME:
             should_exit = True
             exit_reason = f"TIME EXIT - {EXIT_TIME_IST_STR} IST"
@@ -582,7 +751,15 @@ def monitor_and_exit():
                 json.dump(position, f, indent=2)
             
             POSITION_FILE.unlink()
-            
+
+            # Append to CSV
+            if CSV_AVAILABLE:
+                try:
+                    append_trade(position)
+                    logger.info("Trade appended to CSV")
+                except Exception as csv_err:
+                    logger.error(f"Failed to append to CSV: {csv_err}")
+
             logger.info(f"POSITION CLOSED - P&L: ₹{final_pnl:.0f}")
             
             if TELEGRAM_AVAILABLE:
