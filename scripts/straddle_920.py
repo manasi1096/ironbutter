@@ -70,7 +70,7 @@ MAX_GAP_THRESHOLD = int(os.getenv('MAX_GAP_THRESHOLD', 200))
 EARLY_PROFIT_PCT = float(os.getenv('EARLY_PROFIT_PCT', 60))
 
 # VIX threshold - skip trade if India VIX is above this level
-VIX_THRESHOLD = float(os.getenv('VIX_THRESHOLD', 18))
+VIX_THRESHOLD = float(os.getenv('VIX_THRESHOLD', 25))
 
 # Skip expiry days (low premiums + high margin)
 SKIP_EXPIRY_DAY = os.getenv('SKIP_EXPIRY_DAY', 'true').lower() == 'true'
